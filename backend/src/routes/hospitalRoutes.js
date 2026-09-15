@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const Hospital = require('../models/Hospital');
+const { searchHospitalsByLocation } = require('../services/overpassService');
 
 const router = express.Router();
 
@@ -8,157 +9,171 @@ const router = express.Router();
 const nearbyCache = new Map();
 const CACHE_TTL_MS = 20 * 60 * 1000;
 
-/**
- * Helper: Geocode location string to Lat/Lng using OpenStreetMap Nominatim API
- */
-async function geocodeLocation(queryStr) {
-  try {
-    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
-      queryStr
-    )}&format=json&limit=1`;
+// In-memory cache for Google Place Details (TTL: 6 Hours)
+const detailsCache = new Map();
+const DETAILS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
-    const response = await axios.get(url, {
-      headers: {
-        'User-Agent': 'SmartQueue-Health-Tracker/1.0 (contact@smartqueuehealth.org)',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-      timeout: 8000,
+/**
+ * @route   GET /api/hospitals/photo
+ * @desc    Secure proxy for Google Places Photo API (keeps API key server-side)
+ * @access  Public
+ */
+router.get('/photo', async (req, res) => {
+  try {
+    const { ref, maxwidth } = req.query;
+    if (!ref) {
+      return res.status(400).json({ success: false, message: 'Photo reference string is required.' });
+    }
+
+    const apiKey = process.env.GOOGLE_PLACES_KEY || process.env.VITE_GOOGLE_PLACES_KEY;
+    if (!apiKey || apiKey.includes('YOUR_GOOGLE_PLACES_API_KEY')) {
+      return res.status(503).json({ success: false, message: 'Google Places API key is not configured.' });
+    }
+
+    const photoUrl = `https://maps.googleapis.com/maps/api/place/photo?maxwidth=${maxwidth || 600}&photo_reference=${encodeURIComponent(ref)}&key=${apiKey}`;
+
+    const response = await axios({
+      method: 'get',
+      url: photoUrl,
+      responseType: 'stream',
+      timeout: 10000,
     });
 
-    if (response.data && response.data.length > 0) {
-      const item = response.data[0];
-      return {
-        lat: parseFloat(item.lat),
-        lng: parseFloat(item.lon),
-        displayName: item.display_name,
-      };
-    }
+    res.set('Content-Type', response.headers['content-type'] || 'image/jpeg');
+    res.set('Cache-Control', 'public, max-age=86400'); // Cache browser images for 24h
+    response.data.pipe(res);
   } catch (err) {
-    console.warn(`[Geocoding] Nominatim lookup failed for "${queryStr}":`, err.message);
+    console.warn('[Photo Proxy] Error fetching photo:', err.message);
+    return res.status(404).json({ success: false, message: 'Photo unavailable.' });
   }
-  return null;
-}
+});
 
 /**
- * Helper: Fetch real hospitals/clinics using OpenStreetMap Overpass API (with fallback mirror)
+ * @route   GET /api/hospitals/details/:placeId
+ * @desc    Secure 6-hour cached proxy for Google Places Place Details API
+ * @access  Public
  */
-async function fetchOverpassHospitals(lat, lng, radiusMeters = 10000) {
-  const overpassQuery = `[out:json][timeout:15];
-(
-  node["amenity"="hospital"](around:${radiusMeters},${lat},${lng});
-  way["amenity"="hospital"](around:${radiusMeters},${lat},${lng});
-  relation["amenity"="hospital"](around:${radiusMeters},${lat},${lng});
-  node["amenity"="clinic"](around:${radiusMeters},${lat},${lng});
-  way["amenity"="clinic"](around:${radiusMeters},${lat},${lng});
-  relation["amenity"="clinic"](around:${radiusMeters},${lat},${lng});
-  node["healthcare"="hospital"](around:${radiusMeters},${lat},${lng});
-  way["healthcare"="hospital"](around:${radiusMeters},${lat},${lng});
-  node["healthcare"="clinic"](around:${radiusMeters},${lat},${lng});
-  way["healthcare"="clinic"](around:${radiusMeters},${lat},${lng});
-);
-out center 40;`;
-
-  const mirrors = [
-    'https://overpass-api.de/api/interpreter',
-    'https://overpass.kumi.systems/api/interpreter',
-  ];
-
-  for (const mirrorUrl of mirrors) {
-    try {
-      const response = await axios.post(
-        mirrorUrl,
-        `data=${encodeURIComponent(overpassQuery)}`,
-        {
-          headers: {
-            'User-Agent': 'SmartQueue-Health-Tracker/1.0 (contact@smartqueuehealth.org)',
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          timeout: 10000,
-        }
-      );
-
-      if (response.data && response.data.elements) {
-        return response.data.elements;
-      }
-    } catch (err) {
-      console.warn(`[Overpass API] Mirror ${mirrorUrl} failed:`, err.message);
+router.get('/details/:placeId', async (req, res) => {
+  try {
+    const { placeId } = req.params;
+    if (!placeId) {
+      return res.status(400).json({ success: false, message: 'Place ID is required.' });
     }
+
+    // 1. Check 6-Hour In-Memory Cache
+    const cached = detailsCache.get(placeId);
+    if (cached && Date.now() - cached.timestamp < DETAILS_CACHE_TTL_MS) {
+      return res.status(200).json({
+        success: true,
+        source: 'cache',
+        data: cached.data,
+      });
+    }
+
+    const apiKey = process.env.GOOGLE_PLACES_KEY || process.env.VITE_GOOGLE_PLACES_KEY;
+    if (!apiKey || apiKey.includes('YOUR_GOOGLE_PLACES_API_KEY')) {
+      return res.status(200).json({
+        success: true,
+        source: 'fallback',
+        data: {
+          place_id: placeId,
+          name: 'Hospital Facility',
+          formatted_address: 'Not available',
+          formatted_phone_number: 'Not available',
+          website: null,
+          rating: 'Not available',
+          user_ratings_total: 0,
+          opening_hours: 'Not available',
+          reviews: [],
+          photos: [],
+          business_status: 'OPERATIONAL',
+        },
+      });
+    }
+
+    // 2. Fetch Place Details from Google Places REST API
+    const fields = 'name,formatted_address,formatted_phone_number,website,rating,user_ratings_total,reviews,opening_hours,photos,types,business_status,geometry';
+    const googleUrl = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${encodeURIComponent(placeId)}&fields=${fields}&key=${apiKey}`;
+
+    const googleRes = await axios.get(googleUrl, { timeout: 10000 });
+
+    if (googleRes.data && googleRes.data.status === 'OK' && googleRes.data.result) {
+      const p = googleRes.data.result;
+
+      const mappedPhotos = (p.photos || []).slice(0, 5).map((photo) => ({
+        photo_reference: photo.photo_reference,
+        proxy_url: `/api/hospitals/photo?ref=${encodeURIComponent(photo.photo_reference)}&maxwidth=600`,
+      }));
+
+      const mappedReviews = (p.reviews || []).slice(0, 3).map((r) => ({
+        author_name: r.author_name || 'Anonymous Reviewer',
+        rating: r.rating || 5,
+        text: r.text || '',
+        relative_time_description: r.relative_time_description || 'Recently',
+        profile_photo_url: r.profile_photo_url || null,
+      }));
+
+      const cleanDetails = {
+        place_id: placeId,
+        name: p.name || 'Hospital Facility',
+        formatted_address: p.formatted_address || 'Not available',
+        formatted_phone_number: p.formatted_phone_number || 'Not available',
+        website: p.website || null,
+        rating: p.rating ? parseFloat(p.rating.toFixed(1)) : 'Not available',
+        user_ratings_total: p.user_ratings_total || 0,
+        opening_hours: p.opening_hours
+          ? p.opening_hours.weekday_text
+            ? p.opening_hours.weekday_text.join(' • ')
+            : p.opening_hours.open_now
+            ? 'Open Now'
+            : 'Closed'
+          : 'Not available',
+        open_now: p.opening_hours ? p.opening_hours.open_now : null,
+        reviews: mappedReviews,
+        photos: mappedPhotos,
+        business_status: p.business_status || 'OPERATIONAL',
+        types: p.types || [],
+        geometry: p.geometry || null,
+      };
+
+      // Store in 6-hour cache
+      detailsCache.set(placeId, { timestamp: Date.now(), data: cleanDetails });
+
+      return res.status(200).json({
+        success: true,
+        source: 'google',
+        data: cleanDetails,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      source: 'not_found',
+      data: {
+        place_id: placeId,
+        name: 'Hospital Facility',
+        formatted_address: 'Not available',
+        formatted_phone_number: 'Not available',
+        website: null,
+        rating: 'Not available',
+        user_ratings_total: 0,
+        opening_hours: 'Not available',
+        reviews: [],
+        photos: [],
+        business_status: 'OPERATIONAL',
+      },
+    });
+  } catch (err) {
+    console.error(`Error fetching Place Details for ${req.params.placeId}:`, err.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error while fetching hospital details.',
+    });
   }
-  return [];
-}
+});
 
-/**
- * Haversine formula to compute distance in KM between 2 lat/lng points
- */
-function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371; // Earth radius in km
-  const dLat = (lat2 - lat1) * (Math.PI / 180);
-  const dLon = (lon2 - lon1) * (Math.PI / 180);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(lat1 * (Math.PI / 180)) *
-      Math.cos(lat2 * (Math.PI / 180)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return Math.round(R * c * 10) / 10;
-}
 
-/**
- * Classify hospital as 'Government', 'Private', or 'Clinic'
- */
-function classifyHospitalType(elem) {
-  const tags = elem.tags || {};
-  const name = (tags.name || tags['name:en'] || tags['official_name'] || '').toLowerCase();
-  const operatorType = (tags['operator:type'] || '').toLowerCase();
-  const operator = (tags['operator'] || '').toLowerCase();
-  const amenity = (tags['amenity'] || tags['healthcare'] || '').toLowerCase();
 
-  if (amenity === 'clinic') {
-    return 'Clinic';
-  }
-
-  const isGovt =
-    operatorType.includes('gov') ||
-    operatorType.includes('public') ||
-    operator.includes('gov') ||
-    operator.includes('public') ||
-    operator.includes('department of health') ||
-    operator.includes('ministry of health') ||
-    /\b(govt|government|district hospital|general hospital|gh|public hospital|medical college hospital)\b/i.test(name);
-
-  if (isGovt) {
-    return 'Government';
-  }
-
-  return 'Private';
-}
-
-/**
- * Extract clean address string from OSM tags
- */
-function parseFullAddress(tags, district, state, fallbackDisplayName) {
-  if (tags['addr:full']) return tags['addr:full'];
-
-  const parts = [
-    tags['addr:housenumber'],
-    tags['addr:street'],
-    tags['addr:suburb'] || tags['addr:neighborhood'] || tags['addr:district'],
-    tags['addr:city'] || district,
-    tags['addr:state'] || state,
-    tags['addr:postcode'],
-  ].filter(Boolean);
-
-  if (parts.length >= 2) {
-    return parts.join(', ');
-  }
-
-  if (fallbackDisplayName) {
-    return fallbackDisplayName.split(', ').slice(0, 4).join(', ');
-  }
-
-  return [district, state].filter(Boolean).join(', ') || 'Address on file';
-}
 
 /**
  * @route   GET /api/hospitals/search
@@ -167,179 +182,31 @@ function parseFullAddress(tags, district, state, fallbackDisplayName) {
  */
 router.get('/search', async (req, res) => {
   try {
-    const { country, state, district, area, radius, search, crowdStatus } = req.query;
-
-    const radiusMeters = parseInt(radius, 10) || 10000; // Default 10km radius
-
-    // 1. Build location query string
-    const locationParts = [area, district, state, country].filter(
-      (p) => p && p.trim() !== '' && p !== 'All' && p !== 'All Districts'
-    );
-
-    if (locationParts.length === 0) {
-      return res.status(200).json({
-        success: true,
-        count: 0,
-        data: [],
-        message: 'Please select a location to search nearby hospitals.',
-      });
-    }
-
-    const locationQuery = locationParts.join(', ');
-    const cacheKey = `search_${locationQuery}_r${radiusMeters}`;
-
-    // Check cache
-    const cached = nearbyCache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-      let filteredData = cached.data;
-
-      // Apply client-side search filter
-      if (search && search.trim() !== '') {
-        const sRegex = new RegExp(search.trim(), 'i');
-        filteredData = filteredData.filter(
-          (h) => sRegex.test(h.name) || sRegex.test(h.address) || sRegex.test(h.category)
-        );
-      }
-      if (crowdStatus && crowdStatus !== 'All') {
-        filteredData = filteredData.filter((h) => h.crowdStatus === crowdStatus);
-      }
-
-      return res.status(200).json({
-        success: true,
-        source: 'cache',
-        count: filteredData.length,
-        locationQuery,
-        data: filteredData,
-      });
-    }
-
-    // 2. Geocode location string via Nominatim
-    const geo = await geocodeLocation(locationQuery);
-
-    if (!geo) {
-      return res.status(200).json({
-        success: true,
-        count: 0,
-        data: [],
-        message: `Could not geocode location "${locationQuery}". Try selecting a nearby city.`,
-      });
-    }
-
-    // 3. Call Overpass API for hospitals and clinics
-    let osmElements = [];
-    try {
-      osmElements = await fetchOverpassHospitals(geo.lat, geo.lng, radiusMeters);
-    } catch (err) {
-      console.warn('[Overpass Search] API error or timeout:', err.message);
-    }
-
-    // 4. Map Overpass elements to clean Hospital objects
-    const crowdLevels = ['Low', 'Moderate', 'High', 'Critical'];
-    const deptList = [
-      ['General Medicine', 'Emergency', 'OPD'],
-      ['Pediatrics', 'Orthopedics', 'Surgery'],
-      ['Cardiology', 'Neurology', 'ENT'],
-      ['Outpatient Clinic', 'Diagnostics'],
-    ];
-
-    const hospitals = osmElements
-      .map((elem, idx) => {
-        const tags = elem.tags || {};
-        const hName = tags.name || tags['name:en'] || tags['official_name'] || null;
-        if (!hName) return null;
-
-        const hLat = elem.lat || (elem.center && elem.center.lat) || geo.lat;
-        const hLng = elem.lon || (elem.center && elem.center.lon) || geo.lng;
-
-        // Haversine distance
-        const distanceKm = calculateHaversineDistance(geo.lat, geo.lng, hLat, hLng);
-
-        const category = classifyHospitalType(elem);
-        const address = parseFullAddress(tags, district, state, geo.displayName);
-        const phone =
-          tags['phone'] ||
-          tags['contact:phone'] ||
-          tags['phone:mobile'] ||
-          null;
-
-        const emergency =
-          tags['emergency'] === 'yes' ||
-          tags['emergency'] === '24/7' ||
-          category === 'Government';
-
-        const seed = elem.id || idx;
-        const crowd = crowdLevels[seed % crowdLevels.length];
-        const queueLen = (seed % 15) + 3;
-        const avgWait = queueLen * 4;
-        const rating = (4.1 + ((seed % 9) / 10)).toFixed(1);
-        const depts = deptList[seed % deptList.length];
-        const hexId = String(elem.id).padStart(24, '0').slice(-24);
-
-        return {
-          _id: hexId,
-          name: hName,
-          code: `${category === 'Government' ? 'GOVT' : category === 'Clinic' ? 'CLIN' : 'PRIV'}-${elem.id}`,
-          category,
-          district: district || tags['addr:city'] || 'Central District',
-          state: state || 'Region',
-          area: area || tags['addr:suburb'] || '',
-          address,
-          phone,
-          rating: parseFloat(rating),
-          crowdStatus: crowd,
-          currentQueueLength: queueLen,
-          avgWaitTimeMinutes: avgWait,
-          departments: depts,
-          operatingHours: tags['opening_hours'] || (category === 'Clinic' ? '09:00 AM - 07:00 PM' : '24/7 Open'),
-          emergencyServices: emergency,
-          distanceKm,
-          lat: hLat,
-          lng: hLng,
-        };
-      })
-      .filter(Boolean);
-
-    // Deduplicate by name
-    const uniqueHospitals = [];
-    const seen = new Set();
-    for (const h of hospitals) {
-      const key = h.name.toLowerCase();
-      if (!seen.has(key)) {
-        seen.add(key);
-        uniqueHospitals.push(h);
-      }
-    }
-
-    // Sort by distanceKm ascending
-    uniqueHospitals.sort((a, b) => a.distanceKm - b.distanceKm);
-
-    // Save to cache
-    nearbyCache.set(cacheKey, { timestamp: Date.now(), data: uniqueHospitals });
-
-    // Client side filtering
-    let finalData = uniqueHospitals;
-    if (search && search.trim() !== '') {
-      const sRegex = new RegExp(search.trim(), 'i');
-      finalData = finalData.filter(
-        (h) => sRegex.test(h.name) || sRegex.test(h.address) || sRegex.test(h.category)
-      );
-    }
-    if (crowdStatus && crowdStatus !== 'All') {
-      finalData = finalData.filter((h) => h.crowdStatus === crowdStatus);
-    }
+    const results = await searchHospitalsByLocation(req.query);
 
     return res.status(200).json({
       success: true,
-      count: finalData.length,
-      locationGeo: geo,
-      data: finalData,
+      count: results.length,
+      data: results,
     });
   } catch (error) {
     console.error('Error in /hospitals/search:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Server error while searching hospitals.',
-    });
+    // Never return a raw error to frontend — fallback cleanly to seeded DB records
+    try {
+      const fallbackRecords = await Hospital.find({}).lean();
+      return res.status(200).json({
+        success: true,
+        count: fallbackRecords.length,
+        data: fallbackRecords,
+        message: 'Fallback to default hospital database.',
+      });
+    } catch (fallbackErr) {
+      return res.status(200).json({
+        success: true,
+        count: 0,
+        data: [],
+      });
+    }
   }
 });
 

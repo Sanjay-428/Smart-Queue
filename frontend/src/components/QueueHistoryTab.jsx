@@ -49,10 +49,13 @@ export default function QueueHistoryTab({ onSelectActiveToken }) {
       statusFilter === 'All' ||
       (statusFilter === 'Active' ? ['Waiting', 'Serving'].includes(t.status) : t.status === statusFilter);
 
+    const hospitalNameStr = t.hospitalName || t.hospitalId?.name || '';
+    const departmentStr = t.department || t.hospitalId?.department || '';
+
     const matchesSearch =
       t.tokenNumber?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      t.hospitalName?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      t.department?.toLowerCase().includes(searchQuery.toLowerCase());
+      hospitalNameStr.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      departmentStr.toLowerCase().includes(searchQuery.toLowerCase());
 
     return matchesStatus && matchesSearch;
   });

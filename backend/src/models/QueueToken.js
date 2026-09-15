@@ -20,7 +20,11 @@ const queueTokenSchema = new mongoose.Schema(
     hospitalId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Hospital',
-      required: true,
+      required: false,
+    },
+    placeId: {
+      type: String,
+      index: true,
     },
     hospitalName: {
       type: String,
@@ -48,6 +52,22 @@ const queueTokenSchema = new mongoose.Schema(
       type: String,
       enum: ['Waiting', 'Serving', 'Completed', 'Cancelled'],
       default: 'Waiting',
+    },
+    counterNumber: {
+      type: String,
+      default: '',
+    },
+    holdRequested: {
+      type: Boolean,
+      default: false,
+    },
+    smsPhoneNumber: {
+      type: String,
+      default: '',
+    },
+    smsAlertsEnabled: {
+      type: Boolean,
+      default: false,
     },
     joinedAt: {
       type: Date,

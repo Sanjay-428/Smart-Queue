@@ -22,7 +22,9 @@ export default function Navbar({
   setUserRole,
   notifications,
   onMarkAsRead,
-  onClearAll
+  onClearAll,
+  soundMuted,
+  onToggleSound,
 }) {
   const [showNotifications, setShowNotifications] = useState(false);
   const [showRoleDropdown, setShowRoleDropdown] = useState(false);
@@ -130,6 +132,8 @@ export default function Navbar({
                 onClearAll={onClearAll}
                 isOpen={showNotifications}
                 onClose={() => setShowNotifications(false)}
+                soundMuted={soundMuted}
+                onToggleSound={onToggleSound}
               />
             </div>
 

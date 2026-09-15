@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useAuth } from '../context/AuthContext';
 import {
   Building2,
@@ -17,12 +17,15 @@ import {
   ShieldCheck,
   Landmark,
   Building,
-  Stethoscope
+  Stethoscope,
+  ExternalLink,
+  Car
 } from 'lucide-react';
 import api from '../api/axios';
 
 import Navbar from '../components/Navbar';
 import ActiveTokenCard from '../components/ActiveTokenCard';
+import TokenPassModal from '../components/TokenPassModal';
 import HospitalModal from '../components/HospitalModal';
 import JoinQueueModal from '../components/JoinQueueModal';
 import QueueHistoryTab from '../components/QueueHistoryTab';
@@ -73,10 +76,88 @@ const DashboardPage = () => {
   const [selectedHospital, setSelectedHospital] = useState(null);
   const [joinHospital, setJoinHospital] = useState(null);
   const [activeToken, setActiveToken] = useState(null);
+  const [isPassModalOpen, setIsPassModalOpen] = useState(false);
+  const [soundMuted, setSoundMuted] = useState(false);
 
   const [loading, setLoading] = useState(true);
   const [geoLoading, setGeoLoading] = useState(false);
   const [geoDetectedMessage, setGeoDetectedMessage] = useState('');
+
+  // Live Location & Google Maps Places API SDK State
+  const googleApiKey = import.meta.env.VITE_GOOGLE_PLACES_KEY;
+  const [userCoords, setUserCoords] = useState({ lat: 13.0827, lng: 80.2707 }); // default Chennai/Central
+  const [mapsLoaded, setMapsLoaded] = useState(false);
+
+  const searchInputRef = useRef(null);
+  const autocompleteRef = useRef(null);
+  const watchIdRef = useRef(null);
+
+  // 1. Continuous Live Geolocation Tracking (watchPosition)
+  useEffect(() => {
+    if (navigator.geolocation) {
+      watchIdRef.current = navigator.geolocation.watchPosition(
+        (pos) => {
+          setUserCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        },
+        (err) => {
+          console.warn('[Geolocation] watchPosition warning:', err.message);
+        },
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 }
+      );
+    }
+    return () => {
+      if (watchIdRef.current !== null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+      }
+    };
+  }, []);
+
+  // 2. Load Google Maps Places SDK dynamically
+  useEffect(() => {
+    if (!googleApiKey || googleApiKey === 'YOUR_GOOGLE_PLACES_API_KEY') return;
+
+    if (window.google && window.google.maps && window.google.maps.places) {
+      setMapsLoaded(true);
+      return;
+    }
+
+    const existingScript = document.getElementById('google-maps-places-script');
+    if (existingScript) {
+      existingScript.addEventListener('load', () => setMapsLoaded(true));
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.id = 'google-maps-places-script';
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(googleApiKey)}&libraries=places`;
+    script.async = true;
+    script.defer = true;
+    script.onload = () => setMapsLoaded(true);
+    document.head.appendChild(script);
+  }, [googleApiKey]);
+
+  // 3. Attach Google Places Autocomplete to Search Input
+  useEffect(() => {
+    if (mapsLoaded && searchInputRef.current && !autocompleteRef.current) {
+      const autocomplete = new window.google.maps.places.Autocomplete(searchInputRef.current, {
+        types: ['(regions)'],
+      });
+
+      autocomplete.addListener('place_changed', () => {
+        const place = autocomplete.getPlace();
+        if (place.geometry && place.geometry.location) {
+          const newPos = {
+            lat: place.geometry.location.lat(),
+            lng: place.geometry.location.lng(),
+          };
+          setUserCoords(newPos);
+          setSearchQuery(place.name || place.formatted_address || '');
+        }
+      });
+
+      autocompleteRef.current = autocomplete;
+    }
+  }, [mapsLoaded]);
 
   const addNotification = (notif) => {
     const newNotif = {
@@ -126,9 +207,180 @@ const DashboardPage = () => {
     }
   };
 
-  // Fetch real nearby hospitals via OpenStreetMap Overpass search
+  // Classify place types to Government, Private, or Clinic
+  const classifyCategory = (types = [], name = '') => {
+    const n = name.toLowerCase();
+    if (types.includes('doctor') || types.includes('health') || n.includes('clinic')) return 'Clinic';
+    if (n.includes('govt') || n.includes('government') || n.includes('general hospital') || n.includes('public')) return 'Government';
+    return 'Private';
+  };
+
+  // Fetch verified queue status from backend DB by place_id
+  const fetchQueueForPlace = async (placeId) => {
+    try {
+      const response = await api.get(`/queue/place/${placeId}`);
+      if (response.data && response.data.available) {
+        return response.data.data;
+      }
+    } catch (err) {
+      console.warn(`Queue lookup for ${placeId} failed:`, err.message);
+    }
+    return null;
+  };
+
+  // Distance Matrix calculation for driving distance + travel time
+  const calculateDistanceMatrix = (origin, places) => {
+    return new Promise((resolve) => {
+      if (!window.google || !window.google.maps || places.length === 0) {
+        resolve(places);
+        return;
+      }
+      const service = new window.google.maps.DistanceMatrixService();
+      const destinations = places.map((p) => p.geometry.location);
+
+      service.getDistanceMatrix(
+        {
+          origins: [origin],
+          destinations: destinations,
+          travelMode: window.google.maps.TravelMode.DRIVING,
+          unitSystem: window.google.maps.UnitSystem.METRIC,
+        },
+        (response, status) => {
+          if (status === 'OK' && response.rows[0]) {
+            const elements = response.rows[0].elements;
+            const updated = places.map((p, i) => {
+              const el = elements[i];
+              if (el && el.status === 'OK') {
+                return {
+                  ...p,
+                  distanceText: el.distance.text,
+                  distanceValue: el.distance.value,
+                  durationText: el.duration.text,
+                };
+              }
+              return {
+                ...p,
+                distanceText: 'Not available',
+                distanceValue: 999999,
+                durationText: 'Not available',
+              };
+            });
+            updated.sort((a, b) => a.distanceValue - b.distanceValue);
+            resolve(updated);
+          } else {
+            resolve(places);
+          }
+        }
+      );
+    });
+  };
+
+  // Fetch real hospitals from Google Places API (or backend fallback)
   const fetchHospitals = useCallback(async () => {
     setLoading(true);
+
+    // Primary: Google Places API JS SDK
+    if (window.google && window.google.maps && window.google.maps.places) {
+      try {
+        const dummyDiv = document.createElement('div');
+        const service = new window.google.maps.places.PlacesService(dummyDiv);
+
+        const request = {
+          location: new window.google.maps.LatLng(userCoords.lat, userCoords.lng),
+          radius: 10000,
+          type: ['hospital'],
+        };
+
+        service.nearbySearch(request, async (results, status) => {
+          if (status === window.google.maps.places.PlacesServiceStatus.OK && results) {
+            // Get full Place Details for each result
+            const detailedList = await Promise.all(
+              results.slice(0, 15).map((place) => {
+                return new Promise((resolve) => {
+                  service.getDetails(
+                    {
+                      placeId: place.place_id,
+                      fields: [
+                        'place_id',
+                        'name',
+                        'formatted_address',
+                        'formatted_phone_number',
+                        'website',
+                        'rating',
+                        'user_ratings_total',
+                        'opening_hours',
+                        'photos',
+                        'reviews',
+                        'geometry',
+                        'business_status',
+                        'types',
+                      ],
+                    },
+                    (detail, detailStatus) => {
+                      if (detailStatus === window.google.maps.places.PlacesServiceStatus.OK && detail) {
+                        resolve(detail);
+                      } else {
+                        resolve(place);
+                      }
+                    }
+                  );
+                });
+              })
+            );
+
+            // Compute real driving distance & travel time via Distance Matrix
+            const sortedPlaces = await calculateDistanceMatrix(userCoords, detailedList);
+
+            // Fetch separate backend queue data for each place_id
+            const mappedHospitals = await Promise.all(
+              sortedPlaces.map(async (p, idx) => {
+                const qData = await fetchQueueForPlace(p.place_id);
+                const cat = classifyCategory(p.types, p.name);
+
+                return {
+                  _id: p.place_id,
+                  place_id: p.place_id,
+                  name: p.name,
+                  code: `PLC-${p.place_id.substring(0, 6).toUpperCase()}`,
+                  category: cat,
+                  address: p.formatted_address || p.vicinity || 'Not available',
+                  phone: p.formatted_phone_number || 'Not available',
+                  website: p.website || null,
+                  rating: p.rating ? parseFloat(p.rating.toFixed(1)) : 'Not available',
+                  user_ratings_total: p.user_ratings_total || 0,
+                  distanceKm: p.distanceText ? p.distanceText : 'Not available',
+                  durationText: p.durationText || 'Not available',
+                  currentQueueLength: qData ? qData.currentQueueLength : 'Not available',
+                  avgWaitTimeMinutes: qData ? qData.avgWaitTimeMinutes : 'Not available',
+                  crowdStatus: qData ? qData.crowdStatus : 'Low',
+                  emergencyServices: true,
+                  departments: ['General Medicine', 'Outpatient OPD', 'Emergency Care', 'Pediatrics', 'Cardiology'],
+                };
+              })
+            );
+
+            // Apply crowd status filter if selected
+            let filtered = mappedHospitals;
+            if (selectedCrowd && selectedCrowd !== 'All') {
+              filtered = filtered.filter((h) => h.crowdStatus === selectedCrowd);
+            }
+            if (searchQuery.trim() !== '') {
+              const regex = new RegExp(searchQuery.trim(), 'i');
+              filtered = filtered.filter((h) => regex.test(h.name) || regex.test(h.address));
+            }
+
+            setHospitals(filtered);
+            setLoading(false);
+            return;
+          }
+        });
+        return;
+      } catch (err) {
+        console.warn('Google Places API call failed, using backend fallback:', err.message);
+      }
+    }
+
+    // Secondary / Fallback: Backend API
     try {
       const params = {};
       if (selectedCountry) params.country = selectedCountry;
@@ -153,11 +405,11 @@ const DashboardPage = () => {
         setHospitals(response.data.data);
       }
     } catch (error) {
-      console.error('Failed to fetch real hospitals:', error);
+      console.error('Failed to fetch hospitals:', error);
     } finally {
       setLoading(false);
     }
-  }, [selectedCountry, selectedState, selectedDistrict, selectedArea, searchQuery, selectedCrowd]);
+  }, [userCoords, mapsLoaded, selectedCountry, selectedState, selectedDistrict, selectedArea, searchQuery, selectedCrowd]);
 
   useEffect(() => {
     fetchDistricts();
@@ -174,12 +426,30 @@ const DashboardPage = () => {
   const handleDetectLocation = () => {
     setGeoLoading(true);
     setGeoDetectedMessage('');
-    setTimeout(() => {
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const lat = pos.coords.latitude;
+          const lng = pos.coords.longitude;
+          setUserCoords({ lat, lng });
+          setGeoDetectedMessage(`Detected: Live Location (${lat.toFixed(3)}°, ${lng.toFixed(3)}°)`);
+          setGeoLoading(false);
+          fetchHospitals();
+          setTimeout(() => setGeoDetectedMessage(''), 4000);
+        },
+        () => {
+          setSelectedDistrict('Central District');
+          setGeoDetectedMessage('Detected: Central District Core');
+          setGeoLoading(false);
+          setTimeout(() => setGeoDetectedMessage(''), 4000);
+        }
+      );
+    } else {
       setSelectedDistrict('Central District');
       setGeoDetectedMessage('Detected: Central District Core');
       setGeoLoading(false);
       setTimeout(() => setGeoDetectedMessage(''), 4000);
-    }, 800);
+    }
   };
 
   const handleTokenIssued = (newToken) => {
@@ -232,6 +502,8 @@ const DashboardPage = () => {
         notifications={notifications}
         onMarkAsRead={handleMarkAsRead}
         onClearAll={handleClearNotifications}
+        soundMuted={soundMuted}
+        onToggleSound={() => setSoundMuted(!soundMuted)}
       />
 
       {/* Main Content Body */}
@@ -242,6 +514,8 @@ const DashboardPage = () => {
             token={activeToken}
             onCancelled={handleTokenCancelled}
             onRefresh={fetchActiveToken}
+            onViewPass={() => setIsPassModalOpen(true)}
+            addNotification={addNotification}
           />
         )}
 
@@ -340,8 +614,9 @@ const DashboardPage = () => {
                 <div className="md:col-span-9 relative">
                   <Search className="w-4 h-4 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2" />
                   <input
+                    ref={searchInputRef}
                     type="text"
-                    placeholder="Search hospitals by name, department, or code..."
+                    placeholder="Search hospitals by name, department, or location worldwide..."
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                     className="w-full bg-slate-900/90 border border-slate-800 focus:border-cyan-500 text-slate-100 placeholder-slate-500 text-xs rounded-xl pl-11 pr-4 py-3 outline-none transition-all"
@@ -445,9 +720,9 @@ const DashboardPage = () => {
                             </span>
                           )}
 
-                          {hospital.distanceKm !== undefined && (
+                          {hospital.distanceKm !== undefined && hospital.distanceKm !== 'Not available' && (
                             <span className="px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 text-[11px] font-semibold border border-cyan-500/20">
-                              📍 ~{hospital.distanceKm} km
+                              📍 ~{hospital.distanceKm} {hospital.durationText ? `· ${hospital.durationText}` : ''}
                             </span>
                           )}
                         </div>
@@ -476,16 +751,32 @@ const DashboardPage = () => {
                         <span className="truncate">{hospital.address}</span>
                       </p>
 
-                      {/* Clickable Phone Number */}
-                      {hospital.phone && (
+                      {/* Phone Number */}
+                      {hospital.phone && hospital.phone !== 'Not available' && (
                         <a
                           href={`tel:${hospital.phone}`}
                           onClick={(e) => e.stopPropagation()}
-                          className="inline-flex items-center gap-1.5 text-xs text-cyan-400 hover:text-cyan-300 font-semibold mb-3 transition-colors"
+                          className="inline-flex items-center gap-1.5 text-xs text-cyan-400 hover:text-cyan-300 font-semibold mb-2 transition-colors"
                         >
                           <Phone className="w-3.5 h-3.5 text-cyan-400" />
                           <span>{hospital.phone}</span>
                         </a>
+                      )}
+
+                      {/* Verified Hospital Website Link */}
+                      {hospital.website && (
+                        <div className="mb-3">
+                          <a
+                            href={hospital.website}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            className="inline-flex items-center gap-1 text-xs text-cyan-400 hover:text-cyan-300 font-semibold transition-colors"
+                          >
+                            <span>View Doctors & Departments →</span>
+                            <ExternalLink className="w-3 h-3" />
+                          </a>
+                        </div>
                       )}
 
                       {/* Live Queue Metrics */}
@@ -495,7 +786,9 @@ const DashboardPage = () => {
                             <Users className="w-3 h-3 text-blue-400" /> Queue Length
                           </div>
                           <div className="font-bold text-white mt-0.5">
-                            {hospital.currentQueueLength} patients
+                            {typeof hospital.currentQueueLength === 'number'
+                              ? `${hospital.currentQueueLength} patients`
+                              : 'Not available'}
                           </div>
                         </div>
                         <div>
@@ -503,7 +796,9 @@ const DashboardPage = () => {
                             <Clock className="w-3 h-3 text-cyan-400" /> Avg Wait Time
                           </div>
                           <div className="font-bold text-cyan-300 mt-0.5">
-                            ~{hospital.avgWaitTimeMinutes} mins
+                            {typeof hospital.avgWaitTimeMinutes === 'number'
+                              ? `~${hospital.avgWaitTimeMinutes} mins`
+                              : 'Not available'}
                           </div>
                         </div>
                       </div>
@@ -560,7 +855,20 @@ const DashboardPage = () => {
         )}
 
         {/* TAB 3: Doctor Schedules */}
-        {activeTab === 'doctors' && <DoctorSchedulesTab userRole={userRole} />}
+        {activeTab === 'doctors' && (
+          <DoctorSchedulesTab
+            userRole={userRole}
+            onBookDoctorSlot={(token, doctor, slot) => {
+              setActiveToken(token);
+              addNotification({
+                title: `OPD Slot Booked with ${doctor.name}`,
+                message: `Token ${token.tokenNumber} issued for ${slot}. Room: ${doctor.roomNumber || 'Room 102'}.`,
+                type: 'status',
+              });
+              setActiveTab('hospitals');
+            }}
+          />
+        )}
 
         {/* TAB 4: Staff & Admin Management Portal */}
         {activeTab === 'staff' && (
@@ -585,6 +893,13 @@ const DashboardPage = () => {
           onSuccess={handleTokenIssued}
         />
       )}
+
+      {/* Digital OPD Pass Modal */}
+      <TokenPassModal
+        token={activeToken}
+        isOpen={isPassModalOpen}
+        onClose={() => setIsPassModalOpen(false)}
+      />
     </div>
   );
 };

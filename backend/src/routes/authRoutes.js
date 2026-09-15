@@ -72,4 +72,23 @@ router.post('/login', async (req, res) => {
   }
 });
 
+/**
+ * @route   GET /api/auth/me
+ * @desc    Get currently logged in user profile from JWT Token
+ * @access  Private
+ */
+const verifyToken = require('../middleware/authMiddleware');
+router.get('/me', verifyToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select('-password');
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User profile not found.' });
+    }
+    return res.status(200).json({ success: true, user });
+  } catch (err) {
+    console.error('Error fetching user profile:', err);
+    return res.status(500).json({ success: false, message: 'Server error fetching user profile.' });
+  }
+});
+
 module.exports = router;

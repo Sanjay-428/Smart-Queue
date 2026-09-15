@@ -3,11 +3,11 @@ import { X, Building2, Stethoscope, Clock, Users, Ticket, AlertCircle } from 'lu
 import api from '../api/axios';
 
 const JoinQueueModal = ({ hospital, onClose, onSuccess }) => {
-  const [selectedDept, setSelectedDept] = useState(
-    hospital?.departments && hospital.departments.length > 0
-      ? hospital.departments[0]
-      : 'General Care'
-  );
+  const deptsList = hospital?.departments && hospital.departments.length > 0
+    ? hospital.departments
+    : ['General Medicine', 'Outpatient OPD', 'Emergency Care', 'Pediatrics', 'Cardiology'];
+
+  const [selectedDept, setSelectedDept] = useState(deptsList[0]);
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
 
@@ -19,10 +19,19 @@ const JoinQueueModal = ({ hospital, onClose, onSuccess }) => {
     setErrorMsg('');
 
     try {
-      const response = await api.post('/queue/join', {
-        hospitalId: hospital._id,
+      const payload = {
         department: selectedDept,
-      });
+      };
+
+      if (hospital._id) {
+        payload.hospitalId = hospital._id;
+      }
+      if (hospital.place_id) {
+        payload.placeId = hospital.place_id;
+        payload.hospitalName = hospital.name;
+      }
+
+      const response = await api.post('/queue/join', payload);
 
       if (response.data?.success) {
         onSuccess(response.data.data);
@@ -78,7 +87,7 @@ const JoinQueueModal = ({ hospital, onClose, onSuccess }) => {
               onChange={(e) => setSelectedDept(e.target.value)}
               className="w-full bg-slate-900 border border-slate-800 focus:border-teal-500 text-white text-xs rounded-xl p-3.5 outline-none cursor-pointer"
             >
-              {hospital.departments && hospital.departments.map((dept, idx) => (
+              {deptsList.map((dept, idx) => (
                 <option key={idx} value={dept} className="bg-slate-900 text-white">
                   {dept}
                 </option>

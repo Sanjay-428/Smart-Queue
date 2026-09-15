@@ -14,6 +14,11 @@ const hospitalSchema = new mongoose.Schema(
       uppercase: true,
       trim: true,
     },
+    googlePlaceId: {
+      type: String,
+      index: true,
+      sparse: true,
+    },
     state: {
       type: String,
       required: true,
